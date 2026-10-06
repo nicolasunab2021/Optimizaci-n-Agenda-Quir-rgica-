@@ -1,0 +1,121 @@
+import pulp
+import pandas as pd
+
+cirugias = [f"Cirugia_{i}" for i in range(1, 11)]
+pabellones = ["Pabellon_1", "Pabellon_2"]
+dias = ["Lunes", "Martes"]
+
+duracion_estimada_fase1 = {
+    "Cirugia_1": 130, "Cirugia_2": 90,  "Cirugia_3": 115, "Cirugia_4": 60,
+    "Cirugia_5": 140, "Cirugia_6": 80,  "Cirugia_7": 105, "Cirugia_8": 75,
+    "Cirugia_9": 120, "Cirugia_10": 95
+}
+
+tiempo_recambio_minutos = {c: 25 for c in cirugias}
+
+prioridad_cirugias = {
+    "Cirugia_1": 10, "Cirugia_2": 5,  "Cirugia_3": 8, "Cirugia_4": 3,
+    "Cirugia_5": 9,  "Cirugia_6": 4,  "Cirugia_7": 7, "Cirugia_8": 6,
+    "Cirugia_9": 8,  "Cirugia_10": 5
+}
+
+requiere_cama = {c: 1 for c in cirugias}
+
+capacidad_turno = {(j, k): 480 for j in pabellones for k in dias}
+costo_minuto_extra = 1.5
+costo_minuto_ocioso = 1.0
+sobretiempo_max = 60
+limite_camas = {k: 4 for k in dias}
+
+prob = pulp.LpProblem("Programacion_Pabellones_Traumatologia", pulp.LpMinimize)
+
+x = pulp.LpVariable.dicts("x", (cirugias, pabellones, dias), cat="Binary")
+
+O = pulp.LpVariable.dicts("Sobretiempo", (pabellones, dias), lowBound=0, cat="Continuous")
+
+I = pulp.LpVariable.dicts("Ocioso", (pabellones, dias), lowBound=0, cat="Continuous")
+
+
+penalizacion_costos = pulp.lpSum(
+    costo_minuto_extra * O[j][k] + costo_minuto_ocioso * I[j][k]
+    for j in pabellones for k in dias
+)
+
+beneficio_prioridades = pulp.lpSum(
+    prioridad_cirugias[i] * x[i][j][k]
+    for i in cirugias for j in pabellones for k in dias
+)
+
+prob += penalizacion_costos - beneficio_prioridades, "Costo_Total_Operativo"
+
+
+for i in cirugias:
+    prob += (
+        pulp.lpSum(x[i][j][k] for j in pabellones for k in dias) <= 1,
+        f"Restriccion_Exclusion_{i}"
+    )
+
+for j in pabellones:
+    for k in dias:
+        tiempo_ocupado = pulp.lpSum(
+            (duracion_estimada_fase1[i] + tiempo_recambio_minutos[i]) * x[i][j][k]
+            for i in cirugias
+        )
+        prob += (
+            tiempo_ocupado - O[j][k] + I[j][k] == capacidad_turno[(j, k)],
+            f"Restriccion_Capacidad_{j}_{k}"
+        )
+
+for j in pabellones:
+    for k in dias:
+        prob += (
+            O[j][k] <= sobretiempo_max,
+            f"Restriccion_Sobretiempo_{j}_{k}"
+        )
+
+for k in dias:
+    prob += (
+        pulp.lpSum(requiere_cama[i] * x[i][j][k] for i in cirugias for j in pabellones) <= limite_camas[k],
+        f"Restriccion_Capacidad_Camas_{k}"
+    )
+
+solver = pulp.PULP_CBC_CMD(msg=False)
+prob.solve(solver)
+
+print(f"Estado de la Solución: {pulp.LpStatus[prob.status]}")
+print(f"Valor de la Función Objetivo: {pulp.value(prob.objective):.2f}\n")
+
+programacion = []
+
+for k in dias:
+    for j in pabellones:
+        asignadas = [i for i in cirugias if pulp.value(x[i][j][k]) == 1]
+        
+        asignadas_ordenadas = sorted(asignadas, key=lambda c: duracion_estimada_fase1[c], reverse=True)
+        
+        tiempo_acumulado = 0
+        for pos, c in enumerate(asignadas_ordenadas, 1):
+            inicio = tiempo_acumulado
+            fin = inicio + duracion_estimada_fase1[c]
+            tiempo_acumulado = fin + tiempo_recambio_minutos[c]
+            
+            programacion.append({
+                "Día": k,
+                "Pabellón": j,
+                "Turno": pos,
+                "Cirugía": c,
+                "Duración (min)": duracion_estimada_fase1[c],
+                "Hora Inicio (min)": inicio,
+                "Hora Fin (min)": fin,
+                "Próximo Recambio (min)": tiempo_recambio_minutos[c]
+            })
+
+df_res = pd.DataFrame(programacion)
+print(df_res.to_string(index=False))
+
+print("\n--- RESUMEN DE INDICADORES DE EFICIENCIA ---")
+for k in dias:
+    for j in pabellones:
+        Sobre = pulp.value(O[j][k])
+        Ocioso = pulp.value(I[j][k])
+        print(f"[{k}] {j} -> Sobretiempo: {Sobre:.0f} min | Tiempo Ocioso: {Ocioso:.0f} min")
