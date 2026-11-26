@@ -1,121 +1,174 @@
 import pulp
 import pandas as pd
+import numpy as np
+import scipy.stats as stats
 
-cirugias = [f"Cirugia_{i}" for i in range(1, 11)]
+excel_path = "Base de Datos Duraciones de Cirugias.xlsx"
+df_raw = pd.read_excel(excel_path, sheet_name="Datos")
+
+tipos_validos = [
+    "Osteosíntesis de Tibia",
+    "Artroplastia Total de Rodilla",
+    "Artroplastia Total de Cadera",
+    "Reconstrucción LCA (Artroscopia)"
+]
+df_cir = df_raw[df_raw["Tipo de Cirugía"].isin(tipos_validos)].copy()
+df_realized = df_cir[df_cir["Estado Cirugía"] == "Realizada"].copy()
+
+for col in [
+    "Tiempo Pre-Quirúrgico (min)",
+    "Tiempo Cirugía (min)",
+    "Tiempo Post-Quirúrgico / Salida (min)",
+    "Tiempo Total Ocupación Sala (min)"
+]:
+    df_realized[col] = pd.to_numeric(df_realized[col], errors="coerce")
+
+perfiles_distribucion = {}
+for proc in tipos_validos:
+    sub = df_realized[df_realized["Tipo de Cirugía"] == proc]
+    t_cir = sub["Tiempo Cirugía (min)"].dropna().astype(float)
+    t_pre = sub["Tiempo Pre-Quirúrgico (min)"].dropna().astype(float)
+    t_post = sub["Tiempo Post-Quirúrgico / Salida (min)"].dropna().astype(float)
+
+    if proc == "Osteosíntesis de Tibia":
+        k_w, _, lam_w = stats.weibull_min.fit(t_cir, floc=0)
+        t_robusto = stats.weibull_min.ppf(0.75, c=k_w, scale=lam_w)
+    elif proc == "Artroplastia Total de Rodilla":
+        s_ln, _, sc_ln = stats.lognorm.fit(t_cir, floc=0)
+        t_robusto = stats.lognorm.ppf(0.75, s=s_ln, scale=sc_ln)
+    else:
+        mu_n, std_n = stats.norm.fit(t_cir)
+        t_robusto = stats.norm.ppf(0.75, loc=mu_n, scale=std_n)
+
+    perfiles_distribucion[proc] = {
+        "t_pre_medio": round(t_pre.mean(), 1),
+        "t_cir_p75": round(t_robusto, 1),
+        "t_post_medio": round(t_post.mean(), 1),
+        "t_ocupacion_total": round(t_pre.mean() + t_robusto + t_post.mean(), 1)
+    }
+
+df_demanda = pd.concat([
+    df_cir[df_cir["Estado Cirugía"] == "Suspendida"].head(8),
+    df_realized.sample(14, random_state=42)
+]).reset_index(drop=True)
+
+cirugias = df_demanda["ID Cirugía"].tolist()
 pabellones = ["Pabellon_1", "Pabellon_2"]
-dias = ["Lunes", "Martes"]
+dias = ["Lunes", "Martes", "Miercoles"]
 
-duracion_estimada_fase1 = {
-    "Cirugia_1": 130, "Cirugia_2": 90,  "Cirugia_3": 115, "Cirugia_4": 60,
-    "Cirugia_5": 140, "Cirugia_6": 80,  "Cirugia_7": 105, "Cirugia_8": 75,
-    "Cirugia_9": 120, "Cirugia_10": 95
-}
+duracion_ocupacion_sala = {}
+prioridad_clinica = {}
+requiere_cama_postop = {}
 
-tiempo_recambio_minutos = {c: 25 for c in cirugias}
+for _, row in df_demanda.iterrows():
+    cid = row["ID Cirugía"]
+    tipo = row["Tipo de Cirugía"]
+    duracion_ocupacion_sala[cid] = perfiles_distribucion[tipo]["t_ocupacion_total"]
 
-prioridad_cirugias = {
-    "Cirugia_1": 10, "Cirugia_2": 5,  "Cirugia_3": 8, "Cirugia_4": 3,
-    "Cirugia_5": 9,  "Cirugia_6": 4,  "Cirugia_7": 7, "Cirugia_8": 6,
-    "Cirugia_9": 8,  "Cirugia_10": 5
-}
+    if row["Estado Cirugía"] == "Suspendida" or tipo == "Osteosíntesis de Tibia":
+        prioridad_clinica[cid] = 1
+    elif row["Complicación / Criterio Especial"] == "Sí":
+        prioridad_clinica[cid] = 2
+    else:
+        prioridad_clinica[cid] = 3
 
-requiere_cama = {c: 1 for c in cirugias}
+    requiere_cama_postop[cid] = (
+        1 if tipo in ["Artroplastia Total de Rodilla", "Artroplastia Total de Cadera"] else 0
+    )
 
-capacidad_turno = {(j, k): 480 for j in pabellones for k in dias}
-costo_minuto_extra = 1.5
-costo_minuto_ocioso = 1.0
-sobretiempo_max = 60
-limite_camas = {k: 4 for k in dias}
+capacidad_bloque = {(j, k): 480 for j in pabellones for k in dias}
+sobretiempo_max_laboral = 60
+limite_camas_dia = {k: 4 for k in dias}
 
-prob = pulp.LpProblem("Programacion_Pabellones_Traumatologia", pulp.LpMinimize)
+costo_minuto_extra = 4500
+costo_minuto_ocioso = 3000
+costo_cirugia_postergada = 250000
+
+prob = pulp.LpProblem("Optimizacion_Agenda_Quirurgica_Traumatologia", pulp.LpMinimize)
 
 x = pulp.LpVariable.dicts("x", (cirugias, pabellones, dias), cat="Binary")
-
 O = pulp.LpVariable.dicts("Sobretiempo", (pabellones, dias), lowBound=0, cat="Continuous")
-
 I = pulp.LpVariable.dicts("Ocioso", (pabellones, dias), lowBound=0, cat="Continuous")
 
-
-penalizacion_costos = pulp.lpSum(
-    costo_minuto_extra * O[j][k] + costo_minuto_ocioso * I[j][k]
-    for j in pabellones for k in dias
-)
-
-beneficio_prioridades = pulp.lpSum(
-    prioridad_cirugias[i] * x[i][j][k]
-    for i in cirugias for j in pabellones for k in dias
-)
-
-prob += penalizacion_costos - beneficio_prioridades, "Costo_Total_Operativo"
-
-
-for i in cirugias:
-    prob += (
-        pulp.lpSum(x[i][j][k] for j in pabellones for k in dias) <= 1,
-        f"Restriccion_Exclusion_{i}"
+prob += (
+    pulp.lpSum(costo_minuto_extra * O[j][k] + costo_minuto_ocioso * I[j][k] for j in pabellones for k in dias)
+    + pulp.lpSum(
+        costo_cirugia_postergada * (1 - pulp.lpSum(x[i][j][k] for j in pabellones for k in dias))
+        for i in cirugias
     )
+), "Costo_Total_Operativo_CLP"
 
+# Restricción 1: Asignación máxima a un bloque
+for i in cirugias:
+    prob += pulp.lpSum(x[i][j][k] for j in pabellones for k in dias) <= 1, f"R1_Unicidad_{i}"
+
+# Restricción 2: Prioridad clínica estricta como restricción dura
+for i in cirugias:
+    if prioridad_clinica[i] == 1:
+        prob += pulp.lpSum(x[i][j][k] for j in pabellones for k in dias) == 1, f"R2_Prioridad_{i}"
+
+# Restricción 3: Balance de capacidad de bloque
 for j in pabellones:
     for k in dias:
-        tiempo_ocupado = pulp.lpSum(
-            (duracion_estimada_fase1[i] + tiempo_recambio_minutos[i]) * x[i][j][k]
-            for i in cirugias
-        )
         prob += (
-            tiempo_ocupado - O[j][k] + I[j][k] == capacidad_turno[(j, k)],
-            f"Restriccion_Capacidad_{j}_{k}"
+            pulp.lpSum(duracion_ocupacion_sala[i] * x[i][j][k] for i in cirugias) - O[j][k] + I[j][k]
+            == capacidad_bloque[(j, k)],
+            f"R3_Capacidad_{j}_{k}"
         )
 
+# Restricción 4: Límite normativo de sobretiempo laboral
 for j in pabellones:
     for k in dias:
-        prob += (
-            O[j][k] <= sobretiempo_max,
-            f"Restriccion_Sobretiempo_{j}_{k}"
-        )
+        prob += O[j][k] <= sobretiempo_max_laboral, f"R4_Sobretiempo_{j}_{k}"
 
+# Restricción 5: Límite diario de camas postoperatorias
 for k in dias:
     prob += (
-        pulp.lpSum(requiere_cama[i] * x[i][j][k] for i in cirugias for j in pabellones) <= limite_camas[k],
-        f"Restriccion_Capacidad_Camas_{k}"
+        pulp.lpSum(requiere_cama_postop[i] * x[i][j][k] for i in cirugias for j in pabellones)
+        <= limite_camas_dia[k],
+        f"R5_Camas_{k}"
     )
 
-solver = pulp.PULP_CBC_CMD(msg=False)
-prob.solve(solver)
+prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
-print(f"Estado de la Solución: {pulp.LpStatus[prob.status]}")
-print(f"Valor de la Función Objetivo: {pulp.value(prob.objective):.2f}\n")
+print(f"Estado: {pulp.LpStatus[prob.status]}")
+print(f"Costo Total Operativo Óptimo: ${pulp.value(prob.objective):,.0f} CLP\n")
 
 programacion = []
-
 for k in dias:
     for j in pabellones:
         asignadas = [i for i in cirugias if pulp.value(x[i][j][k]) == 1]
-        
-        asignadas_ordenadas = sorted(asignadas, key=lambda c: duracion_estimada_fase1[c], reverse=True)
-        
-        tiempo_acumulado = 0
-        for pos, c in enumerate(asignadas_ordenadas, 1):
-            inicio = tiempo_acumulado
-            fin = inicio + duracion_estimada_fase1[c]
-            tiempo_acumulado = fin + tiempo_recambio_minutos[c]
-            
+        asignadas_ordenadas = sorted(
+            asignadas, key=lambda c: (prioridad_clinica[c], -duracion_ocupacion_sala[c])
+        )
+        t_acum = 0.0
+        for turno, c in enumerate(asignadas_ordenadas, 1):
+            tipo_c = df_demanda.loc[df_demanda["ID Cirugía"] == c, "Tipo de Cirugía"].values[0]
+            inicio = t_acum
+            fin = inicio + duracion_ocupacion_sala[c]
+            t_acum = fin
             programacion.append({
                 "Día": k,
                 "Pabellón": j,
-                "Turno": pos,
-                "Cirugía": c,
-                "Duración (min)": duracion_estimada_fase1[c],
-                "Hora Inicio (min)": inicio,
-                "Hora Fin (min)": fin,
-                "Próximo Recambio (min)": tiempo_recambio_minutos[c]
+                "Turno": turno,
+                "ID Cirugía": c,
+                "Procedimiento": tipo_c,
+                "Prioridad": prioridad_clinica[c],
+                "Ocupación Sala P75 (min)": duracion_ocupacion_sala[c],
+                "Inicio (min)": round(inicio, 1),
+                "Fin (min)": round(fin, 1)
             })
 
 df_res = pd.DataFrame(programacion)
 print(df_res.to_string(index=False))
 
-print("\n--- RESUMEN DE INDICADORES DE EFICIENCIA ---")
-for k in dias:
-    for j in pabellones:
-        Sobre = pulp.value(O[j][k])
-        Ocioso = pulp.value(I[j][k])
-        print(f"[{k}] {j} -> Sobretiempo: {Sobre:.0f} min | Tiempo Ocioso: {Ocioso:.0f} min")
+cap_total = sum(capacidad_bloque.values())
+uso_efectivo = df_res["Ocupación Sala P75 (min)"].sum()
+ocioso_total = sum(pulp.value(I[j][k]) for j in pabellones for k in dias)
+extra_total = sum(pulp.value(O[j][k]) for j in pabellones for k in dias)
+
+print("\n--- INDICADORES DE DENSIDAD Y EFICIENCIA ---")
+print(f"Cirugías Programadas: {len(df_res)} / {len(cirugias)} ({len(df_res)/len(cirugias):.1%})")
+print(f"Capacidad Base: {cap_total} min | Uso Efectivo: {uso_efectivo:.1f} min")
+print(f"Densidad de Agenda: {(uso_efectivo / cap_total):.1%}")
+print(f"Tiempo Ocioso: {ocioso_total:.1f} min | Sobretiempo: {extra_total:.1f} min")
