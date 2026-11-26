@@ -1,138 +1,222 @@
-import pulp
-import pandas as pd
 import numpy as np
-from scipy.stats import lognorm
+import pandas as pd
+import scipy.stats as stats
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-cirugias = [f"Cirugia_{i}" for i in range(1, 11)]
-pabellones = ["Pabellon_1", "Pabellon_2"]
-dias = ["Lunes", "Martes"]
+excel_path = "Base de Datos Duraciones de Cirugias.xlsx"
+df_raw = pd.read_excel(excel_path, sheet_name="Datos")
 
-duracion_estimada_fase1 = {
-    "Cirugia_1": 130, "Cirugia_2": 90,  "Cirugia_3": 115, "Cirugia_4": 60,
-    "Cirugia_5": 140, "Cirugia_6": 80,  "Cirugia_7": 105, "Cirugia_8": 75,
-    "Cirugia_9": 120, "Cirugia_10": 95
-}
+tipos_validos = [
+    "Osteosíntesis de Tibia",
+    "Artroplastia Total de Rodilla",
+    "Artroplastia Total de Cadera",
+    "Reconstrucción LCA (Artroscopia)"
+]
 
-tiempo_recambio_minutos = {c: 25 for c in cirugias}
+df_cir = df_raw[df_raw["Tipo de Cirugía"].isin(tipos_validos)].copy()
+df_real = df_cir[df_cir["Estado Cirugía"] == "Realizada"].copy()
 
-prioridad_cirugias = {
-    "Cirugia_1": 10, "Cirugia_2": 5,  "Cirugia_3": 8, "Cirugia_4": 3,
-    "Cirugia_5": 9,  "Cirugia_6": 4,  "Cirugia_7": 7, "Cirugia_8": 6,
-    "Cirugia_9": 8,  "Cirugia_10": 5
-}
+for col in [
+    "Tiempo Pre-Quirúrgico (min)",
+    "Tiempo Cirugía (min)",
+    "Tiempo Post-Quirúrgico / Salida (min)",
+    "Tiempo Total Ocupación Sala (min)"
+]:
+    df_real[col] = pd.to_numeric(df_real[col], errors="coerce")
 
-requiere_cama = {c: 1 for c in cirugias}
-capacidad_turno = {(j, k): 480 for j in pabellones for k in dias}
-costo_minuto_extra = 1.5
-costo_minuto_ocioso = 1.0
-sobretiempo_max = 60
-limite_camas = {k: 4 for k in dias}
+perfiles_cirugia = {}
+for proc in tipos_validos:
+    sub = df_real[df_real["Tipo de Cirugía"] == proc]
+    t_cir = sub["Tiempo Cirugía (min)"].dropna().astype(float)
+    t_pre = sub["Tiempo Pre-Quirúrgico (min)"].dropna().astype(float)
+    t_post = sub["Tiempo Post-Quirúrgico / Salida (min)"].dropna().astype(float)
 
-lognormal_params = {
-    c: {'mu': np.log(duracion_estimada_fase1[c]) - 0.5 * (0.35**2), 'sigma': 0.35} 
-    for c in cirugias
-}
-
-prob = pulp.LpProblem("Programacion_Pabellones_Traumatologia", pulp.LpMinimize)
-
-x = pulp.LpVariable.dicts("x", (cirugias, pabellones, dias), cat="Binary")
-O = pulp.LpVariable.dicts("Sobretiempo", (pabellones, dias), lowBound=0, cat="Continuous")
-I = pulp.LpVariable.dicts("Ocioso", (pabellones, dias), lowBound=0, cat="Continuous")
-
-penalizacion_costos = pulp.lpSum(
-    costo_minuto_extra * O[j][k] + costo_minuto_ocioso * I[j][k]
-    for j in pabellones for k in dias
-)
-
-beneficio_prioridades = pulp.lpSum(
-    prioridad_cirugias[i] * x[i][j][k]
-    for i in cirugias for j in pabellones for k in dias
-)
-
-prob += penalizacion_costos - beneficio_prioridades, "Costo_Total_Operativo"
-
-for i in cirugias:
-    prob += (
-        pulp.lpSum(x[i][j][k] for j in pabellones for k in dias) <= 1,
-        f"Restriccion_Exclusion_{i}"
-    )
-
-for j in pabellones:
-    for k in dias:
-        tiempo_ocupado = pulp.lpSum(
-            (duracion_estimada_fase1[i] + tiempo_recambio_minutos[i]) * x[i][j][k]
-            for i in cirugias
-        )
-        prob += (
-            tiempo_ocupado - O[j][k] + I[j][k] == capacidad_turno[(j, k)],
-            f"Restriccion_Capacidad_{j}_{k}"
-        )
-
-for j in pabellones:
-    for k in dias:
-        prob += (
-            O[j][k] <= sobretiempo_max,
-            f"Restriccion_Sobretiempo_{j}_{k}"
-        )
-
-for k in dias:
-    prob += (
-        pulp.lpSum(requiere_cama[i] * x[i][j][k] for i in cirugias for j in pabellones) <= limite_camas[k],
-        f"Restriccion_Capacidad_Camas_{k}"
-    )
-
-solver = pulp.PULP_CBC_CMD(msg=False)
-prob.solve(solver)
-
-print(f"Estado de la Solución Óptima (Obj. 2): {pulp.LpStatus[prob.status]}")
-print(f"Valor de la Función Objetivo: {pulp.value(prob.objective):.2f}\n")
-
-agenda_optima = {}
-for k in dias:
-    agenda_optima[k] = {}
-    for j in pabellones:
-        cirugias_asignadas = [i for i in cirugias if pulp.value(x[i][j][k]) == 1]
-        agenda_optima[k][j] = cirugias_asignadas
-
-NUM_SIMULATIONS = 5000
-print(f"Ejecutando Simulación de Monte Carlo ({NUM_SIMULATIONS} iteraciones) sobre la agenda óptima...\n")
-
-resultados_simulacion = []
-
-for k in dias:
-    for j in pabellones:
-        cirugias_asignadas = agenda_optima[k][j]
-        if not cirugias_asignadas:
-            continue
-            
-        overtimes_simulados = []
-        utilizaciones_simuladas = []
+    if proc == "Osteosíntesis de Tibia":
+        shape_w, _, scale_w = stats.weibull_min.fit(t_cir, floc=0)
+        p75_cir = stats.weibull_min.ppf(0.75, c=shape_w, scale=scale_w)
+        perfiles_cirugia[proc] = {
+            "dist": "weibull",
+            "param1": shape_w,
+            "param2": scale_w,
+            "p75_cir": p75_cir,
+            "pre_mean": t_pre.mean(),
+            "pre_sd": t_pre.std(ddof=1),
+            "post_mean": t_post.mean(),
+            "post_sd": t_post.std(ddof=1),
+            "prioridad_base": 1
+        }
+    elif proc == "Artroplastia Total de Rodilla":
+        sd_ln, _, scale_ln = stats.lognorm.fit(t_cir, floc=0)
+        mu_ln = np.log(scale_ln)
+        p75_cir = stats.lognorm.ppf(0.75, s=sd_ln, scale=scale_ln)
+        perfiles_cirugia[proc] = {
+            "dist": "lognorm",
+            "param1": mu_ln,
+            "param2": sd_ln,
+            "p75_cir": p75_cir,
+            "pre_mean": t_pre.mean(),
+            "pre_sd": t_pre.std(ddof=1),
+            "post_mean": t_post.mean(),
+            "post_sd": t_post.std(ddof=1),
+            "prioridad_base": 2
+        }
+    elif proc == "Artroplastia Total de Cadera":
+        mu_n, sd_n = stats.norm.fit(t_cir)
+        p75_cir = stats.norm.ppf(0.75, loc=mu_n, scale=sd_n)
+        perfiles_cirugia[proc] = {
+            "dist": "norm",
+            "param1": mu_n,
+            "param2": sd_n,
+            "p75_cir": p75_cir,
+            "pre_mean": t_pre.mean(),
+            "pre_sd": t_pre.std(ddof=1),
+            "post_mean": t_post.mean(),
+            "post_sd": t_post.std(ddof=1),
+            "prioridad_base": 2
+        }
+    else:
+        mu_n, sd_n = stats.norm.fit(t_cir)
+        p75_cir = stats.norm.ppf(0.75, loc=mu_n, scale=sd_n)
+        perfiles_cirugia[proc] = {
+            "dist": "norm",
+            "param1": mu_n,
+            "param2": sd_n,
+            "p75_cir": p75_cir,
+            "pre_mean": t_pre.mean(),
+            "pre_sd": t_pre.std(ddof=1),
+            "post_mean": t_post.mean(),
+            "post_sd": t_post.std(ddof=1),
+            "prioridad_base": 3
+        }
         
-        for _ in range(NUM_SIMULATIONS):
-            tiempo_total_bloque = 0
-            for c in cirugias_asignadas:
-                p = lognormal_params[c]
-                duracion_estocastica = lognorm.rvs(s=p['sigma'], scale=np.exp(p['mu']))
-                turno_opt = tiempo_recambio_minutos[c]
-                tiempo_total_bloque += (duracion_estocastica + turno_opt)
-            
-            overtime_sim = max(0, tiempo_total_bloque - capacidad_turno[(j, k)])
-            utilizacion_sim = min(1.0, tiempo_total_bloque / capacidad_turno[(j, k)])
-            
-            overtimes_simulados.append(overtime_sim)
-            utilizaciones_simuladas.append(utilizacion_sim)
-            
-        resultados_simulacion.append({
-            "Día": k,
-            "Pabellón": j,
-            "Cirugías Programadas": len(cirugias_asignadas),
-            "Sobretiempo Promedio (min)": np.mean(overtimes_simulados),
-            50: np.percentile(overtimes_simulados, 50),
-            90: np.percentile(overtimes_simulados, 90),
-            95: np.percentile(overtimes_simulados, 95),
-            "Utilización Promedio (%)": np.mean(utilizaciones_simuladas) * 100
-        })
+def generar_tiempos_aleatorios(rng, proc, factor_recambio=1.0, factor_cirugia=1.0):
+    """Genera tiempos aleatorios pre, intra y post."""
+    pf = perfiles_cirugia[proc]
+    t_pre = max(5.0, rng.normal(pf["pre_mean"], pf["pre_sd"]) * factor_recambio)
 
-df_sim = pd.DataFrame(resultados_simulacion)
-print("--- RESULTADOS DE VALIDACIÓN ESTOCÁSTICA ---")
-print(df_sim.to_string(index=False))
+    if pf["dist"] == "weibull":
+        t_cir = rng.weibull(pf["param1"]) * pf["param2"]
+    elif pf["dist"] == "lognorm":
+        t_cir = rng.lognormal(mean=pf["param1"], sigma=pf["param2"])
+    else:
+        t_cir = max(10.0, rng.normal(loc=pf["param1"], scale=pf["param2"]))
+
+    t_cir *= factor_cirugia
+    t_post = max(5.0, rng.normal(pf["post_mean"], pf["post_sd"]) * factor_recambio)
+    return t_pre, t_cir, t_post
+    
+def duracion_robusta_p75(proc):
+    """Duración robusta usada en Objetivo 2 para secuenciar."""
+    pf = perfiles_cirugia[proc]
+    return pf["pre_mean"] + pf["p75_cir"] + pf["post_mean"]
+
+df_muestra = pd.concat([
+    df_cir[df_cir["Estado Cirugía"] == "Suspendida"].head(4),
+    df_real.sample(4, random_state=42)
+]).reset_index(drop=True)
+
+lista_cirugias = []
+for _, row in df_muestra.iterrows():
+    proc = row["Tipo de Cirugía"]
+    prio = 1 if row["Estado Cirugía"] == "Suspendida" else perfiles_cirugia[proc]["prioridad_base"]
+    lista_cirugias.append((row["ID Cirugía"], proc, prio))
+
+secuencia_programada = sorted(
+    lista_cirugias,
+    key=lambda x: (x[2], -duracion_robusta_p75(x[1]))
+)
+
+def simular_escenario_mc(
+    n_iter=5000,
+    n_salas=2,
+    jornada_min=480,
+    tope_sobretiempo=60,
+    cap_urpa=5,
+    factor_recambio=1.0,
+    factor_cirugia=1.0,
+    seed=42
+):
+    rng = np.random.default_rng(seed)
+    sobretiempos_prom = []
+    ociosos_prom = []
+    cumplimiento_pct = []
+    bloqueos_urpa_pct = []
+
+    for _ in range(n_iter):
+        reloj_salas = np.zeros(n_salas)
+        egresos_urpa = []
+        completadas = 0
+        hubo_bloqueo_urpa = 0
+
+        for _, proc, _ in secuencia_programada:
+            t_pre, t_cir, t_post = generar_tiempos_aleatorios(
+                rng, proc, factor_recambio=factor_recambio, factor_cirugia=factor_cirugia
+            )
+            ocupacion_sala = t_pre + t_cir + t_post
+
+            sala_idx = int(np.argmin(reloj_salas))
+            hora_inicio = reloj_salas[sala_idx]
+            hora_fin = hora_inicio + ocupacion_sala
+
+            egresos_urpa = [t for t in egresos_urpa if t > hora_fin]
+            if len(egresos_urpa) >= cap_urpa:
+                hubo_bloqueo_urpa = 1
+                continue
+
+            if hora_inicio <= jornada_min + tope_sobretiempo:
+                reloj_salas[sala_idx] = hora_fin
+                completadas += 1
+                egresos_urpa.append(hora_fin + t_post)
+
+        sobre = np.maximum(0.0, reloj_salas - jornada_min)
+        ocio = np.maximum(0.0, jornada_min - reloj_salas)
+
+        sobretiempos_prom.append(np.mean(sobre))
+        ociosos_prom.append(np.mean(ocio))
+        cumplimiento_pct.append((completadas / len(secuencia_programada)) * 100.0)
+        bloqueos_urpa_pct.append(hubo_bloqueo_urpa * 100.0)
+
+    return {
+        "Sobretiempo_Prom_min": round(float(np.mean(sobretiempos_prom)), 2),
+        "Sobretiempo_P90_min": round(float(np.percentile(sobretiempos_prom, 90)), 2),
+        "Ocio_Prom_min": round(float(np.mean(ociosos_prom)), 2),
+        "Cumplimiento_Pct": round(float(np.mean(cumplimiento_pct)), 2),
+        "Prob_Bloqueo_URPA_Pct": round(float(np.mean(bloqueos_urpa_pct)), 2)
+    }
+
+escenarios = {
+    "E1: Base (480 min, Recambio 100%)": simular_escenario_mc(
+        n_iter=5000, n_salas=2, jornada_min=480, cap_urpa=5, factor_recambio=1.0, factor_cirugia=1.0
+    ),
+    "E2: Recambio Optimizado (-20% Pre/Post)": simular_escenario_mc(
+        n_iter=5000, n_salas=2, jornada_min=480, cap_urpa=5, factor_recambio=0.80, factor_cirugia=1.0
+    ),
+    "E3: Recambio (-20%) + Jornada 510 min": simular_escenario_mc(
+        n_iter=5000, n_salas=2, jornada_min=510, cap_urpa=5, factor_recambio=0.80, factor_cirugia=1.0
+    ),
+    "E4: Estrés Variabilidad (+15% Cirugía)": simular_escenario_mc(
+        n_iter=5000, n_salas=2, jornada_min=480, cap_urpa=5, factor_recambio=1.0, factor_cirugia=1.15
+    )
+}
+
+df_resultados_mc = pd.DataFrame(escenarios).T
+print("=== RESULTADOS SIMULACIÓN MONTE CARLO (5,000 ITERACIONES) ===")
+print(df_resultados_mc.to_string())
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+sns.set_theme(style="whitegrid")
+
+etiquetas = ["E1: Base", "E2: Recambio -20%", "E3: Recambio +510m", "E4: Estrés +15%"]
+axes[0].bar(etiquetas, df_resultados_mc["Sobretiempo_Prom_min"], color=["#4C72B0", "#2CA02C", "#1F77B4", "#D62728"])
+axes[0].set_title("Sobretiempo Promedio por Sala (min)")
+axes[0].set_ylabel("Minutos")
+axes[0].tick_params(axis="x", rotation=15)
+
+axes[1].bar(etiquetas, df_resultados_mc["Ocio_Prom_min"], color=["#4C72B0", "#2CA02C", "#1F77B4", "#D62728"])
+axes[1].set_title("Tiempo Ocioso Promedio por Sala (min)")
+axes[1].set_ylabel("Minutos")
+axes[1].tick_params(axis="x", rotation=15)
+
+plt.tight_layout()
+plt.savefig("simulacion_monte_carlo_fase4.png", dpi=300)
